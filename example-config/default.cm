@@ -1,0 +1,7 @@
+include keys.cm
+include colors.cm
+
+everything #Dim
+alpha #Bright
+esc #Accent
+win #Off

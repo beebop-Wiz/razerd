@@ -1,0 +1,198 @@
+#!/usr/bin/perl
+
+use strict;
+use Time::HiRes qw(usleep);
+use POSIX;
+use IO::Select;
+use Data::Dumper;
+
+my $user = getpwuid($<);
+
+unless(-e "/home/$user/.razerd") {
+    `mkdir -p /home/$user/.razerd`;
+}
+
+if(-e "/home/$user/.razerd/daemon.pid") {
+    my $pidfile;
+    open $pidfile, "/home/$user/.razerd/daemon.pid";
+    my $oldpid = <$pidfile>;
+    chomp $oldpid;
+    print "pid $oldpid\n";
+    kill 'TERM', $oldpid;
+}
+
+POSIX::setsid or die "setsid: $!";
+my $pid = fork ();
+if ($pid < 0) {
+    die "fork: $!";
+} elsif ($pid) {
+    exit 0;
+}
+my $id = getpid();
+my $pidfile;
+open $pidfile, ">/home/$user/.razerd/daemon.pid";
+print $pidfile "$id\n";
+close $pidfile;
+chdir "/";
+umask 0;
+foreach (0 .. (POSIX::sysconf (&POSIX::_SC_OPEN_MAX) || 1024)) {
+    POSIX::close $_
+}
+open (STDIN, "</dev/null");
+open (STDOUT, ">/tmp/razerd-$user.log");
+open (STDERR, ">&STDOUT");
+chdir "/home/$user/.razerd";
+
+my $file = "razerd.cfg";
+
+my %cfvars;
+my @rgb;
+
+
+sub set_var {
+    my $var = shift;
+    my $r = shift;
+    my $g = shift;
+    my $b = shift;
+
+    warn "Unknown variable $var" unless exists $cfvars{$var};
+    if($cfvars{$var}{"type"} eq "key") {
+	$rgb[$cfvars{$var}{"row"}][$cfvars{$var}{"col"} * 3] = $r;
+	$rgb[$cfvars{$var}{"row"}][$cfvars{$var}{"col"} * 3 + 1] = $g;
+	$rgb[$cfvars{$var}{"row"}][$cfvars{$var}{"col"} * 3 + 2] = $b;
+	#	print "$var [$r $g $b]\n";
+    } elsif($cfvars{$var}{"type"} eq "list") {
+	foreach my $subvar (@{$cfvars{$var}{"vars"}}) {
+	    set_var($subvar, $r, $g, $b);
+	}
+    } elsif($cfvars{$var}{"type"} eq "rgb") {
+	warn "You can't set rgb to a color";
+    }
+}
+
+sub parse_file {
+    my $file = shift;
+
+    my $varspec = '([_a-zA-Z][_a-zA-Z0-9]*)';
+    my $keyspec = '([0-9]+)\s*:\s*([0-9]+)';
+    my $rgbspec = '\[\s*([0-2]?[0-9]?[0-9])\s+([0-2]?[0-9]?[0-9])\s+([0-2]?[0-9]?[0-9])\s*\]';
+    while(<$file>) {
+	chomp $_;
+	#	print "> $_\n";
+	if($_ =~ /$varspec\s*=\s*$keyspec/) {
+	    $cfvars{$1} = {"type" => "key", "row" => $2, "col" => $3};
+	    #	    print "$1 = $2 : $3\n";
+	} elsif($_ =~ /$varspec\s*=\s*$rgbspec/) {
+	    $cfvars{$1} = {"type" => "rgb", "r" => $2, "g" => $3, "b" => $4};
+	} elsif($_ =~ /$varspec\s+$rgbspec/) {
+	    set_var($1, $2, $3, $4);
+	} elsif($_ =~ /$varspec\s+#$varspec/) {
+	    if($cfvars{$2}{"type"} eq "rgb") {
+		set_var($1, $cfvars{$2}{"r"}, $cfvars{$2}{"g"}, $cfvars{$2}{"b"});
+	    } else {
+		warn "Can't set a key to another key";
+	    }
+	} elsif($_ =~ /$varspec\s*=\s*((?:$varspec\s+)*$varspec)/) {
+	    $cfvars{$1} = {"type" => "list", "vars" => [split /\s+/, $2]};
+	    #	    print "$1 = " . (join " ", @{$cfvars{$1}{"vars"}}) . "\n";
+	} elsif($_ =~ /include\s+(.*)/) {
+	    my $fh;
+	    open $fh, $1;
+	    #	    print "include $1\n";
+	    parse_file($fh);
+	    close $fh;
+	}
+    }
+}
+
+
+sub load_colorscheme {
+    my $file = shift;
+    my $input;
+    open $input, $file or warn "Couldn't open $file: $!";
+
+    my $ncol = 16;
+    my $nrow = 6;
+
+    for(my $i = 0; $i < $nrow; $i++) {
+	$rgb[$i] = [(0, 0, 0) x $ncol];
+    }
+
+    parse_file($input);
+
+    #print Dumper(%cfvars);
+
+    my $ri = 0;
+
+    foreach my $row (@rgb) {
+	my $command_string = chr($ri++) . chr(0) . chr ($ncol - 1) . join "", map chr, @$row;
+	open MCF, ">/sys/bus/hid/devices/0003:1532:020F.0003/matrix_custom_frame" or die "Couldn't write layout: $!";
+	binmode MCF;
+	binmode STDOUT;
+	print MCF $command_string;
+	#    print $command_string;
+	open MEC, ">/sys/bus/hid/devices/0003:1532:020F.0003/matrix_effect_custom" or die "Couldn't set custom: $!";
+	print MEC "\n";
+	close MCF;
+	close MEC;
+	usleep(50000);
+    }
+}
+
+sub set_profile {
+
+    my $title = shift;
+    
+    my $fh;
+    open $fh, $file;
+    my $last;
+    open $last, "/tmp/windowswitch-$user";
+    my $ltitle = <$last>;
+    return if $ltitle eq $title;
+    close $last;
+    open $last, ">/tmp/windowswitch-$user";
+    print $last $title;
+    
+
+    while(<$fh>) {
+	chomp;
+	my @fields = split /:/;
+	my $name_regex = $fields[0];
+	my $colorscheme = $fields[1];
+	if($title =~ /$name_regex/) {
+	    load_colorscheme($colorscheme);
+	    return;
+	}
+    }
+
+    load_colorscheme("default.cm");
+    close $fh;
+}
+
+my $xprop;
+my ($xprop2, $xprop2pid);
+
+open $xprop, "xprop -root -spy _NET_ACTIVE_WINDOW |";
+
+my $s = IO::Select->new($xprop);
+
+while(1) {
+    my @files = $s->can_read;
+    foreach my $fh (@files) {
+	$_ = <$fh>;
+	if(/_NET_ACTIVE_WINDOW\(WINDOW\): window id # (0x[0-9a-f]+)/) {
+	    if(hex $1 > 0) {
+		my $name = `xdotool getwindowname $1`;
+		if(defined $xprop2) {
+		    $s->remove($xprop2);
+		    kill 'TERM',$xprop2pid;
+		    close $xprop2;
+		}
+		$xprop2pid = open $xprop2, "xprop -id $1 -spy _NET_WM_NAME|";
+		$s->add($xprop2);
+	    }
+	} elsif(/_NET_WM_NAME\(UTF8_STRING\) = \"(.*)\"/) {
+	    set_profile($1);
+	}
+    }
+}

@@ -1,0 +1,10 @@
+Off = [0 0 0]
+Dim = [10 10 10]
+Bright = [255 255 255]
+Accent = [255 0 0]
+
+Movement = [0 0 255]
+Inventory = [255 0 0]
+Bar = [255 255 0]
+Chat = [0 255 255]
+Misc = [255 64 0]
